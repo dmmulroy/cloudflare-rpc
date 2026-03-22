@@ -24,44 +24,27 @@ pnpm install
 
 ## Quick Start
 
-A Durable Object can stay focused on storage and domain behavior while the client layer adds a nicer read model.
+A Durable Object can return raw storage values while the client layer turns them into something nicer for an admin UI.
 
 ```ts
 import { rpcClient, rpcClientPlugin, rpcServer } from 'cloudflare-rpc'
 
-interface LinkRecord {
-  slug: string
-  destination: string
-  clicks: number
-}
-
 class LinkCatalogObject {
-  getLink(slug: string): LinkRecord | null {
+  getClickCount(slug: string): number {
     if (slug === 'docs') {
-      return {
-        slug: 'docs',
-        destination: 'https://developers.cloudflare.com/workers/',
-        clicks: 42,
-      }
+      return 4200
     }
 
-    return null
+    return 0
   }
 }
 
-const presentationPlugin = rpcClientPlugin<LinkCatalogObject>({
+const clickStatsPlugin = rpcClientPlugin<LinkCatalogObject>({
   onSuccess(value, { method }) {
-    if (
-      method === 'getLink'
-      && typeof value === 'object'
-      && value !== null
-      && 'destination' in value
-      && typeof value.destination === 'string'
-    ) {
+    if (method === 'getClickCount' && typeof value === 'number') {
       return {
-        ...value,
-        hostname: new URL(value.destination).hostname,
-        isPopular: 'clicks' in value && typeof value.clicks === 'number' && value.clicks >= 25,
+        count: value,
+        label: `${value.toLocaleString()} clicks`,
       }
     }
 
@@ -73,21 +56,18 @@ export const LinkCatalogRpc = rpcServer(LinkCatalogObject).build()
 
 const links = rpcClient
   .fromNamespace<LinkCatalogObject>(env.LinkCatalogObject)
-  .use(presentationPlugin)
+  .use(clickStatsPlugin)
   .getByName('global')
 
-const link = await links.getLink('docs')
+const stats = await links.getClickCount('docs')
 // {
-//   slug: 'docs',
-//   destination: 'https://developers.cloudflare.com/workers/',
-//   clicks: 42,
-//   hostname: 'developers.cloudflare.com',
-//   isPopular: true,
+//   count: 4200,
+//   label: '4,200 clicks'
 // }
 ```
 
-The Durable Object keeps returning its raw domain shape.
-The client plugin adapts that shape without changing the server implementation.
+The Durable Object stays simple and returns a raw number.
+The client plugin adapts that result for the place it is being used.
 
 ## Contents
 
