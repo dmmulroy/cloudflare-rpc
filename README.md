@@ -24,51 +24,70 @@ pnpm install
 
 ## Quick Start
 
+A Durable Object can stay focused on storage and domain behavior while the client layer adds a nicer read model.
+
 ```ts
-import { RpcTarget } from 'cloudflare:workers'
-import { rpcClient, rpcServer } from 'cloudflare-rpc'
+import { rpcClient, rpcClientPlugin, rpcServer } from 'cloudflare-rpc'
 
-class Counter extends RpcTarget {
-  #value: number
+interface LinkRecord {
+  slug: string
+  destination: string
+  clicks: number
+}
 
-  constructor(value: number) {
-    super()
-    this.#value = value
-  }
+class LinkCatalogObject {
+  getLink(slug: string): LinkRecord | null {
+    if (slug === 'docs') {
+      return {
+        slug: 'docs',
+        destination: 'https://developers.cloudflare.com/workers/',
+        clicks: 42,
+      }
+    }
 
-  increment(amount: number): number {
-    this.#value += amount
-    return this.#value
+    return null
   }
 }
 
-class InventoryAgent {
-  ping(): string {
-    return 'pong'
-  }
+const presentationPlugin = rpcClientPlugin<LinkCatalogObject>({
+  onSuccess(value, { method }) {
+    if (
+      method === 'getLink'
+      && typeof value === 'object'
+      && value !== null
+      && 'destination' in value
+      && typeof value.destination === 'string'
+    ) {
+      return {
+        ...value,
+        hostname: new URL(value.destination).hostname,
+        isPopular: 'clicks' in value && typeof value.clicks === 'number' && value.clicks >= 25,
+      }
+    }
 
-  counter(start: number): Counter {
-    return new Counter(start)
-  }
-}
+    return value
+  },
+})
 
-export const InventoryRpc = rpcServer(InventoryAgent).build()
+export const LinkCatalogRpc = rpcServer(LinkCatalogObject).build()
 
-const inventory = rpcClient
-  .fromNamespace<InventoryAgent>(env.InventoryAgent)
+const links = rpcClient
+  .fromNamespace<LinkCatalogObject>(env.LinkCatalogObject)
+  .use(presentationPlugin)
   .getByName('global')
 
-const pong = await inventory.ping()
-const value = await inventory.counter(2).increment(5)
+const link = await links.getLink('docs')
+// {
+//   slug: 'docs',
+//   destination: 'https://developers.cloudflare.com/workers/',
+//   clicks: 42,
+//   hostname: 'developers.cloudflare.com',
+//   isPopular: true,
+// }
 ```
 
-The important part is that this stays lazy and pipelined:
-
-```ts
-await inventory.counter(2).increment(5)
-```
-
-The client wrapper preserves Cloudflare's native RPC behavior instead of forcing early `await`s.
+The Durable Object keeps returning its raw domain shape.
+The client plugin adapts that shape without changing the server implementation.
 
 ## Contents
 
@@ -101,62 +120,129 @@ This package tries to stay small and close to native behavior while smoothing th
 Use `rpcClient.fromNamespace(...)` when you have a Durable Object namespace binding.
 
 ```ts
-const inventory = rpcClient
-  .fromNamespace<InventoryAgent, { actor: string }>(env.InventoryAgent)
+interface AdminContext {
+  actorEmail: string
+  requestId: string
+}
+
+const links = rpcClient
+  .fromNamespace<LinkCatalogObject, AdminContext>(env.LinkCatalogObject)
   .getByName('global', {
-    context: { actor: 'dashboard' },
+    context: {
+      actorEmail: 'ops@example.com',
+      requestId: crypto.randomUUID(),
+    },
   })
 
-const pong = await inventory.ping()
+const link = await links.getLink('docs')
 ```
+
+This is a good fit for Worker handlers that fetch a named Durable Object on demand.
 
 ### From an existing stub
 
-Use `rpcClient.fromStub(...)` when you already resolved the raw native stub elsewhere.
+Use `rpcClient.fromStub(...)` when some other part of the application already resolved the raw native stub.
 
 ```ts
-const id = env.InventoryAgent.idFromName('global')
-const rawStub = env.InventoryAgent.get(id)
+const id = env.LinkCatalogObject.idFromName('global')
+const rawStub = env.LinkCatalogObject.get(id)
 
-const inventory = rpcClient
-  .fromStub<InventoryAgent>(rawStub)
-  .stub()
+const links = rpcClient
+  .fromStub<LinkCatalogObject, AdminContext>(rawStub)
+  .stub({
+    context: {
+      actorEmail: 'ops@example.com',
+      requestId: crypto.randomUUID(),
+    },
+  })
 ```
+
+This is useful inside helper functions or middleware where you already have the native stub in hand.
 
 ### Returned RPC targets stay typed
 
-If a method returns a `RpcTarget`, the client type reflects that:
+If a method returns a `RpcTarget`, the client reflects that without manual casts.
 
 ```ts
-const value = await inventory.counter(1).increment(2)
-```
+import { RpcTarget } from 'cloudflare:workers'
 
-No manual cast is needed to get the nested stub surface.
-
-## Server API
-
-Wrap a class with `rpcServer(...)` to apply middleware and hooks.
-
-```ts
-class ExampleAgent {
-  ping(): string {
-    return 'pong'
+class LinkEditor extends RpcTarget {
+  setDestination(destination: string): { destination: string } {
+    return { destination }
   }
 }
 
-const Wrapped = rpcServer(ExampleAgent).build()
+class LinkCatalogObject {
+  editor(slug: string): LinkEditor {
+    return new LinkEditor()
+  }
+}
+
+const updated = await links
+  .editor('docs')
+  .setDestination('https://developers.cloudflare.com/durable-objects/')
+```
+
+That means helper objects can stay first-class instead of being flattened into a single giant Durable Object interface.
+
+## Server API
+
+Wrap a class with `rpcServer(...)` to apply server-side middleware and hooks.
+
+```ts
+interface AdminContext {
+  actorEmail: string
+  requestId: string
+}
+
+class LinkCatalogObject {
+  createLink(input: { slug: string; destination: string }) {
+    return input
+  }
+
+  deleteLink(slug: string) {
+    return { slug, deleted: true }
+  }
+
+  health() {
+    return { ok: true }
+  }
+}
+
+const requireAccessPlugin = rpcServerPlugin<LinkCatalogObject, AdminContext>({
+  onRequest({ context }) {
+    if (!context.actorEmail.endsWith('@example.com')) {
+      throw new Error('forbidden')
+    }
+  },
+})
+
+const auditPlugin = rpcServerPlugin<LinkCatalogObject, AdminContext>({
+  async middleware({ method, context, next }) {
+    const result = await next()
+    console.log('rpc audit', {
+      method,
+      actorEmail: context.actorEmail,
+      requestId: context.requestId,
+    })
+    return result
+  },
+})
+
+export const LinkCatalogRpc = rpcServer<typeof LinkCatalogObject, AdminContext>(LinkCatalogObject)
+  .use(requireAccessPlugin)
+  .method('createLink')
+  .use(auditPlugin)
+  .done()
+  .method('deleteLink')
+  .use(auditPlugin)
+  .done()
+  .build()
 ```
 
 ### Per-method configuration is typed
 
-The `.method(...)` builder only accepts valid public method names.
-
-```ts
-const Wrapped = rpcServer(ExampleAgent)
-  .method('ping')
-  .done()
-  .build()
-```
+The `.method(...)` builder only accepts valid public method names, which makes it practical to add targeted policies around high-risk methods like deletes, writes, or billing operations.
 
 ### Agents metadata is preserved
 
@@ -168,49 +254,94 @@ You can attach client-only, server-only, or shared plugins.
 
 ### Client plugin
 
+A practical client plugin can attach request context and emit latency metrics without changing the Durable Object itself.
+
 ```ts
 import { rpcClientPlugin } from 'cloudflare-rpc'
 
-const clientPlugin = rpcClientPlugin<InventoryAgent, { actor: string }>({
+const requestContextPlugin = rpcClientPlugin<LinkCatalogObject, AdminContext>({
   onRequest({ context }) {
     return {
       context: {
-        actor: context.actor,
+        ...context,
+        requestId: context.requestId || crypto.randomUUID(),
       },
     }
   },
 
-  middleware({ next }) {
-    return next().mapSuccess((value) => value)
+  middleware({ method, next }) {
+    const startedAt = Date.now()
+
+    return next().onFinish(({ context, status }) => {
+      console.log('rpc client', {
+        method,
+        actorEmail: context.actorEmail,
+        requestId: context.requestId,
+        status,
+        durationMs: Date.now() - startedAt,
+      })
+    })
   },
 })
 ```
 
 ### Server plugin
 
+A server plugin is a good place for authorization, policy checks, or request normalization.
+
 ```ts
 import { rpcServerPlugin } from 'cloudflare-rpc'
 
-const serverPlugin = rpcServerPlugin<InventoryAgent, { actor: string }>({
-  async middleware({ next }) {
-    return await next()
+const requireAdminPlugin = rpcServerPlugin<LinkCatalogObject, AdminContext>({
+  onRequest({ context }) {
+    if (!context.actorEmail.endsWith('@example.com')) {
+      throw new Error('forbidden')
+    }
   },
 })
 ```
 
 ### Shared plugin
 
+A shared plugin can keep client/server transforms in one place when a transport shape needs to be encoded on the server and decoded on the client.
+
 ```ts
 import { rpcPlugin } from 'cloudflare-rpc'
 
-const sharedPlugin = rpcPlugin<InventoryAgent, { actor: string }>({
+const timestampPlugin = rpcPlugin<LinkCatalogObject, AdminContext>({
   client: {
-    onSuccess(value) {
+    onSuccess(value, { method }) {
+      if (
+        method === 'getLink'
+        && typeof value === 'object'
+        && value !== null
+        && 'updatedAt' in value
+        && typeof value.updatedAt === 'string'
+      ) {
+        return {
+          ...value,
+          updatedAt: new Date(value.updatedAt),
+        }
+      }
+
       return value
     },
   },
   server: {
-    onSuccess({ value }) {
+    onSuccess({ value, method }) {
+      if (
+        method === 'getLink'
+        && typeof value === 'object'
+        && value !== null
+        && 'updatedAt' in value
+        && value.updatedAt instanceof Date
+      ) {
+        return {
+          ...value,
+          updatedAt: value.updatedAt.toISOString(),
+        }
+      }
+
       return value
     },
   },
@@ -220,20 +351,20 @@ const sharedPlugin = rpcPlugin<InventoryAgent, { actor: string }>({
 ### Applying plugins
 
 ```ts
-const inventory = rpcClient
-  .fromNamespace<InventoryAgent, { actor: string }>(env.InventoryAgent)
-  .use(clientPlugin)
-  .use(sharedPlugin)
+const links = rpcClient
+  .fromNamespace<LinkCatalogObject, AdminContext>(env.LinkCatalogObject)
+  .use(requestContextPlugin)
+  .use(timestampPlugin)
   .getByName('global', {
-    context: { actor: 'dashboard' },
+    context: {
+      actorEmail: 'ops@example.com',
+      requestId: crypto.randomUUID(),
+    },
   })
 
-const Wrapped = rpcServer<
-  typeof ExampleAgent,
-  { actor: string }
->(ExampleAgent)
-  .use(serverPlugin)
-  .use(sharedPlugin)
+export const LinkCatalogRpc = rpcServer<typeof LinkCatalogObject, AdminContext>(LinkCatalogObject)
+  .use(requireAdminPlugin)
+  .use(timestampPlugin)
   .build()
 ```
 
@@ -244,45 +375,58 @@ Returned nested RPC graphs are typed and supported.
 ```ts
 import { RpcTarget } from 'cloudflare:workers'
 
-class Counter extends RpcTarget {
+class DailyCounter extends RpcTarget {
   increment(amount: number): number {
     return amount
   }
 }
 
-class ExampleAgent {
-  nestedCounter(start: number): { group: { counter: Counter } } {
+class AnalyticsObject {
+  analytics(slug: string): { today: { counter: DailyCounter } } {
     return {
-      group: {
-        counter: new Counter(),
+      today: {
+        counter: new DailyCounter(),
       },
     }
   }
 }
 
-const client = rpcClient
-  .fromStub<ExampleAgent>(stub)
+const analytics = rpcClient
+  .fromStub<AnalyticsObject>(stub)
   .stub()
 
-await client
-  .nestedCounter(1)
-  .group
+await analytics
+  .analytics('docs')
+  .today
   .counter
-  .increment(2)
+  .increment(1)
 ```
 
-This matters because it keeps Cloudflare's property access and method pipelining behavior intact across nested returned graphs.
+This matters when a Durable Object wants to return focused helpers or stateful RPC targets instead of forcing every operation through a single flat class surface.
 
 ## Explicit short-circuit values
 
 Use `rpcClientCall(...)` to short-circuit a client middleware chain.
 
+A realistic case is a cached health check or metadata endpoint.
+
 ```ts
 import { rpcClientCall, rpcClientPlugin } from 'cloudflare-rpc'
 
-const cachedPlugin = rpcClientPlugin<InventoryAgent, { actor: string }>({
-  middleware({ context }) {
-    return rpcClientCall('cached', { context })
+const healthCache = new Map<string, { ok: boolean; checkedAt: string }>()
+
+const cachedHealthPlugin = rpcClientPlugin<LinkCatalogObject, AdminContext>({
+  middleware({ method, context, next }) {
+    if (method !== 'health') {
+      return next()
+    }
+
+    const cached = healthCache.get(context.actorEmail)
+    if (cached) {
+      return rpcClientCall(cached, { context })
+    }
+
+    return next()
   },
 })
 ```
@@ -292,9 +436,9 @@ Use `rpcValue(...)` when a hook needs to explicitly return a value that might ot
 ```ts
 import { rpcServerPlugin, rpcValue } from 'cloudflare-rpc'
 
-const plugin = rpcServerPlugin<InventoryAgent>({
-  onRequest({ method }) {
-    if (method === 'optionalValue') {
+const optionalDraftPlugin = rpcServerPlugin<LinkCatalogObject>({
+  onRequest({ method, args }) {
+    if (method === 'findDraftBySlug' && args[0] === 'missing') {
       return {
         result: rpcValue(undefined),
       }
