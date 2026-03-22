@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-rpc-test-worker",
+  "main": "src/test-worker.ts",
+  "compatibility_date": "2026-03-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "InventoryAgent",
+        "class_name": "InventoryAgent"
+      },
+      {
+        "name": "AccessorTrapAgent",
+        "class_name": "AccessorTrapAgent"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["InventoryAgent", "AccessorTrapAgent"]
+    }
+  ]
+}
