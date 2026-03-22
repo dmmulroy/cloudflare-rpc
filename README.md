@@ -288,20 +288,37 @@ A shared plugin can keep client/server transforms in one place when a transport 
 ```ts
 import { rpcPlugin } from 'cloudflare-rpc'
 
+interface StoredLink {
+  slug: string
+  destination: string
+  updatedAt: Date
+}
+
+interface ApiLink {
+  slug: string
+  destination: string
+  updatedAt: string
+}
+
+function encodeLink(link: StoredLink): ApiLink {
+  return {
+    ...link,
+    updatedAt: link.updatedAt.toISOString(),
+  }
+}
+
+function decodeLink(link: ApiLink): StoredLink {
+  return {
+    ...link,
+    updatedAt: new Date(link.updatedAt),
+  }
+}
+
 const timestampPlugin = rpcPlugin<LinkCatalogObject, AdminContext>({
   client: {
     onSuccess(value, { method }) {
-      if (
-        method === 'getLink'
-        && typeof value === 'object'
-        && value !== null
-        && 'updatedAt' in value
-        && typeof value.updatedAt === 'string'
-      ) {
-        return {
-          ...value,
-          updatedAt: new Date(value.updatedAt),
-        }
+      if (method === 'getLink' && value) {
+        return decodeLink(value as ApiLink)
       }
 
       return value
@@ -309,17 +326,8 @@ const timestampPlugin = rpcPlugin<LinkCatalogObject, AdminContext>({
   },
   server: {
     onSuccess({ value, method }) {
-      if (
-        method === 'getLink'
-        && typeof value === 'object'
-        && value !== null
-        && 'updatedAt' in value
-        && value.updatedAt instanceof Date
-      ) {
-        return {
-          ...value,
-          updatedAt: value.updatedAt.toISOString(),
-        }
+      if (method === 'getLink' && value) {
+        return encodeLink(value as StoredLink)
       }
 
       return value
